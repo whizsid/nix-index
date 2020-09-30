@@ -13,19 +13,22 @@ use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::{Instant, Duration};
+use std::env::var;
 use futures::{Stream, Future};
 use futures::future::{self, Either};
 use xz2::write::XzDecoder;
 use serde::de::{Deserialize, Deserializer, MapAccess, Visitor};
 use serde_bytes::ByteBuf;
-use hyper::client::{Client, Response, HttpConnector, Request};
-use hyper::{self, Uri, StatusCode, Method};
-use hyper::header::{AcceptEncoding, ContentEncoding, Encoding, Headers, qitem};
+use hyper::client::{Client as HyperClient, HttpConnector, ResponseFuture};
+use hyper::{self, Uri, StatusCode, Method, Response, Request, Body};
+use hyper::header::HeaderMap as Headers;
+use typed_headers::{AcceptEncoding, ContentEncoding, ContentCoding, QualityItem, Quality ,HeaderMapExt};
+use hyper_proxy::ProxyConnector;
 use brotli2::write::BrotliDecoder;
-use tokio_timer::{self, Timer, TimeoutError};
+use tokio::time::{Error as TimeoutError, self as time, Timeout};
 use tokio_retry::{self, Retry};
 use tokio_retry::strategy::ExponentialBackoff;
-use tokio_core::reactor::Handle;
+use tokio::runtime::Handle;
 
 use util;
 use files::FileTree;
@@ -58,8 +61,19 @@ error_chain! {
             display(
                 "response to GET '{}' had unsupported content-encoding ({})",
                 url,
-                encoding.as_ref().map_or("not present".to_string(), |v| format!("'{}'", v)),
+                encoding.as_ref().map_or("not present".to_string(), |v| {
+                    let encodings = **v;
+                    encodings.iter().map(|e|{
+                        format!("{}",e)
+                    })
+                    .collect::<Vec<String>>()
+                    .join(", ")
+                }),
             )
+        }
+        ParseProxy(url: String) {
+            description("proxy url parse error")
+            display("Can not parse the proxy URL ({})", url)
         }
         Timeout {
             description("timeout exceeded")
@@ -70,16 +84,13 @@ error_chain! {
     }
     foreign_links {
         Hyper(hyper::Error);
+        Url(hyper::http::uri::InvalidUri);
     }
 }
 
-impl<T> From<TimeoutError<T>> for Error {
-    fn from(err: TimeoutError<T>) -> Error {
-        use self::TimeoutError::*;
-        match err {
-            Timer(_, e) => Error::with_chain(e, ErrorKind::TimerError),
-            TimedOut(_) => Error::from(ErrorKind::Timeout),
-        }
+impl From<TimeoutError> for Error {
+    fn from(err: TimeoutError) -> Error {
+        Error::with_chain(err, ErrorKind::TimerError)
     }
 }
 
@@ -93,6 +104,60 @@ impl From<tokio_retry::Error<Error>> for Error {
     }
 }
 
+pub enum Client {
+    Proxy(HyperClient<ProxyConnector<HttpConnector>>),
+    NoProxy(HyperClient<HttpConnector>)
+}
+
+impl Client {
+    pub fn new()->Result<Client> {
+        let connector = HttpConnector::new();
+        let http_proxy = var("HTTP_PROXY");
+
+        match http_proxy {
+            Ok(proxy_url)=>{
+                let mut url = url::Url::parse(&proxy_url)
+                    .map_err(|_| ErrorKind::ParseProxy(proxy_url))?;
+                let username = String::from(url.username()).clone();
+                let password = String::from(url.password().unwrap_or_default()).clone();
+
+                url.set_username("").map_err(|_|  url::ParseError::SetHostOnCannotBeABaseUrl)
+                    .map_err(|_| ErrorKind::ParseProxy(proxy_url))?;
+                url.set_password(None).map_err(|_| url::ParseError::SetHostOnCannotBeABaseUrl)
+                    .map_err(|_| ErrorKind::ParseProxy(proxy_url))?;
+
+                // No need to check for the error. Because Url::parse()? already checked it.
+                let uri = url.to_string().parse().unwrap();
+
+                let mut proxy = hyper_proxy::Proxy::new(hyper_proxy::Intercept::All, uri);
+
+                if username != "" {
+                      let credentials =
+                          typed_headers::Credentials::basic(&username, &password)
+                            .map_err(|_| ErrorKind::ParseProxy(proxy_url))?;
+
+                      proxy.set_authorization(credentials);
+                }
+
+                let proxy_connector = hyper_proxy::ProxyConnector::from_proxy(connector, proxy)
+                    .map_err(|_| ErrorKind::ParseProxy(proxy_url))?;
+
+                Ok(Client::Proxy(hyper::Client::builder().build(proxy_connector)))
+            }
+            Err(_)=>{
+                Ok(Client::NoProxy(hyper::Client::builder().build(connector)))
+            }
+        }
+    }
+
+    pub fn request(&self, req: hyper::Request<hyper::Body>) -> hyper::client::ResponseFuture {
+        match self {
+            Client::Proxy(client) => client.request(req),
+            Client::NoProxy(client) => client.request(req),
+        }
+    }
+}
+
 /// A Fetcher allows you to make requests to Hydra/the binary cache.
 ///
 /// It holds all the relevant state for performing requests, such as for example
@@ -101,8 +166,7 @@ impl From<tokio_retry::Error<Error>> for Error {
 /// You should use a single instance of this struct to make all your hydra/binary cache
 /// requests.
 pub struct Fetcher {
-    client: Client<HttpConnector>,
-    timer: Timer,
+    client: Client,
     cache_url: String,
     handle: Handle,
 }
@@ -111,7 +175,7 @@ const RESPONSE_TIMEOUT_MS: u64 = 1000;
 const CONNECT_TIMEOUT_MS: u64 = 10000;
 
 /// A boxed future using this module's error type.
-type BoxFuture<'a, I> = Box<dyn Future<Item = I, Error = Error> + 'a>;
+type BoxFuture<'a, I> = Box<dyn Future<Output = I > + 'a>;
 
 impl Fetcher {
     /// Initializes a new instance of the `Fetcher` struct.
@@ -119,15 +183,13 @@ impl Fetcher {
     /// The `handle` argument is a Handle to the tokio event loop.
     ///
     /// `cache_url` specifies the URL of the binary cache (example: `https://cache.nixos.org`).
-    pub fn new(cache_url: String, handle: Handle) -> Fetcher {
-        let client = Client::new(&handle);
-        let timer = tokio_timer::wheel().build();
-        Fetcher {
+    pub fn new(cache_url: String, handle: Handle) -> Result<Fetcher> {
+        let client = Client::new()?;
+        Ok(Fetcher {
             client: client,
-            timer: timer,
             cache_url: cache_url,
             handle: handle,
-        }
+        })
     }
 
     /// Sends a GET request to the given URL and decodes the response with the given encoding.
@@ -145,7 +207,7 @@ impl Fetcher {
         &self,
         url: String,
         encoding: Option<SupportedEncoding>,
-    ) -> BoxFuture<(String, Option<Vec<u8>>)> {
+    ) -> BoxFuture<Result<(String, Option<Vec<u8>>)>> {
         let strategy = ExponentialBackoff::from_millis(50)
             .max_delay(Duration::from_millis(5000))
             .take(20)
@@ -154,7 +216,7 @@ impl Fetcher {
              // wait at least 5 seconds, as that is the time that cache.nixos.org caches 500 internal server errors
             .map(|x| x + Duration::from_secs(5));
         Box::new(
-            Retry::spawn(self.handle.clone(), strategy, move || {
+            Retry::spawn( strategy, move || {
                 self.fetch_noretry(url.clone(), encoding)
             }).from_err(),
         )
@@ -165,18 +227,21 @@ impl Fetcher {
         &self,
         url: String,
         encoding: Option<SupportedEncoding>,
-    ) -> BoxFuture<(String, Option<Vec<u8>>)> {
-        let uri = Uri::from_str(&url).map_err(|e| Error::from(hyper::Error::from(e)));
-        let process_response = move |res: Response| {
+    ) -> BoxFuture<Result<(String, Option<Vec<u8>>)>> {
+        let uri = Uri::from_str(&url).map_err(|e| Error::from(e));
+        let process_response = move |res: Response<Body>| {
+            
             let code = res.status();
 
-            if code == StatusCode::NotFound {
-                return Either::A(future::ok((url, None)));
+            if code == StatusCode::from_u16(404).unwrap() {
+                return Either::Right(future::ok((url, None)));
             }
 
             if !code.is_success() {
-                return Either::A(future::err(Error::from(ErrorKind::Http(url, code))));
+                return Either::Left(future::err(Error::from(ErrorKind::Http(url, code))));
             }
+
+            let content = res.body().as_bytes();
 
 
             // Determine the encoding. Uses the provided encoding or an encoding computed
@@ -187,16 +252,11 @@ impl Fetcher {
                     return Either::A(future::err(
                         ErrorKind::UnsupportedEncoding(
                             url,
-                            res.headers().get::<ContentEncoding>().cloned(),
+                            res.headers().typed_get::<ContentEncoding>().cloned(),
                         ).into(),
                     ))
                 }
             };
-
-            let content = self.timer.timeout_stream(
-                res.body().map_err(Error::from),
-                Duration::from_millis(RESPONSE_TIMEOUT_MS),
-            );
 
             use self::SupportedEncoding::*;
             let decoded = match encoding {
@@ -254,19 +314,20 @@ impl Fetcher {
         };
 
         let make_request = move |u| {
-            let mut request = Request::new(Method::Get, u);
-            request.headers_mut().set(AcceptEncoding(vec![
-                qitem(Encoding::Brotli),
-                qitem(Encoding::Gzip),
-                qitem(Encoding::Deflate),
+            let mut request = Request::builder().method(Method::GET).uri(u);
+            //let mut request = Request::new(Method::Get, u);
+            request.headers_mut().unwrap().typed_insert(&AcceptEncoding::from(vec![
+                QualityItem::new(ContentCoding::BROTLI, Quality::from_u16(1000)),
+                QualityItem::new(ContentCoding::GZIP, Quality::from_u16(1000)),
+                QualityItem::new(ContentCoding::DEFLATE, Quality::from_u16(1000)),
             ]));
-            self.timer.timeout(
-                self.client.request(request).from_err(),
+            time::timeout(
                 Duration::from_millis(CONNECT_TIMEOUT_MS),
+                self.client.request(request.body(Body::empty()).unwrap()),
             )
         };
 
-        Box::new(future::result(uri).and_then(make_request).and_then(
+        Box::new(future::ok(uri).and_then(make_request).and_then(
             process_response,
         ))
     }
@@ -341,7 +402,7 @@ impl Fetcher {
     pub fn fetch_files<'a>(
         &'a self,
         path: &StorePath,
-    ) -> Box<dyn Future<Item = Option<FileTree>, Error = Error> + 'a> {
+    ) -> Box<dyn Future<Output = Result<Option<FileTree>>> + 'a> {
         let url_xz = format!("{}/{}.ls.xz", self.cache_url, path.hash());
         let url_generic = format!("{}/{}.ls", self.cache_url, path.hash());
         let name = format!("{}.json", path.hash());
@@ -416,15 +477,15 @@ enum SupportedEncoding {
 /// If there is no `Content-Encoding` header we assume that the content is encoded with
 /// the `Identity` variant (i.e. there is no compression at all).
 fn compute_encoding(headers: &Headers) -> Option<SupportedEncoding> {
-    let empty = ContentEncoding(vec![]);
-    let &ContentEncoding(ref encodings) = headers.get::<ContentEncoding>().unwrap_or(&empty);
+    let empty = ContentEncoding::new(vec![]).unwrap();
+    let encodings = headers.typed_get::<ContentEncoding>().unwrap_or(Some(empty))?;
 
-    let identity = Encoding::Identity;
+    let identity = ContentCoding::IDENTITY;
     let encoding = encodings.get(0).unwrap_or(&identity);
     match *encoding {
-        Encoding::Brotli => Some(SupportedEncoding::Brotli),
-        Encoding::Identity => Some(SupportedEncoding::Identity),
-        Encoding::EncodingExt(ref ext) if ext == "xz" => Some(SupportedEncoding::Xz),
+        ContentCoding::BROTLI => Some(SupportedEncoding::Brotli),
+        ContentCoding::IDENTITY => Some(SupportedEncoding::Identity),
+        _ if encoding.as_str() == "xz" =>  Some(SupportedEncoding::Xz),
         _ => None,
     }
 
